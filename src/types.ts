@@ -12,18 +12,14 @@ export interface IRebuilder {
   arch: string;
   buildPath: string;
   buildType: BuildType;
-  cachePath: string;
   debug: boolean;
   disablePreGypCopy: boolean;
-  electronVersion: string;
+  nodeDir: string;
+  nodeLibFile: string;
+  nodeVersion: string;
   force: boolean;
-  headerURL: string;
   lifecycle: EventEmitter;
   mode: RebuildMode;
   msvsVersion?: string;
   platform: string;
-  prebuildTagPrefix: string;
-  buildFromSource: boolean;
-  useCache: boolean;
-  useElectronClang: boolean;
 }

@@ -5,7 +5,7 @@ import path from 'path';
 import { readPackageJson } from './read-package-json';
 import { searchForModule, searchForNodeModules } from './search-module';
 
-const d = debug('electron-rebuild');
+const d = debug('node-rebuild');
 
 export type ModuleType = 'prod' | 'dev' | 'optional';
 

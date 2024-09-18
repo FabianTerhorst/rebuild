@@ -7,7 +7,7 @@ import * as path from 'path';
 import { ELECTRON_GYP_DIR } from './constants';
 import { fetch } from './fetcher';
 
-const d = debug('electron-rebuild');
+const d = debug('node-rebuild');
 
 const sysrootArchAliases = {
   x64: 'amd64',

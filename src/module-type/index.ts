@@ -1,7 +1,6 @@
 import fs from 'fs-extra';
 import path from 'path';
 
-import { NodeAPI } from '../node-api';
 import { readPackageJson } from '../read-package-json';
 import { IRebuilder } from '../types';
 
@@ -10,14 +9,12 @@ type PackageJSONValue = string | Record<string, unknown>;
 export class NativeModule {
   protected rebuilder: IRebuilder;
   private _moduleName: string | undefined;
-  protected modulePath: string
-  public nodeAPI: NodeAPI;
+  protected modulePath: string;
   private packageJSON: Record<string, PackageJSONValue | undefined>;
 
   constructor(rebuilder: IRebuilder, modulePath: string) {
     this.rebuilder = rebuilder;
     this.modulePath = modulePath;
-    this.nodeAPI = new NodeAPI(this.moduleName, this.rebuilder.electronVersion);
   }
 
   get moduleName(): string {
