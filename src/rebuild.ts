@@ -1,24 +1,25 @@
 import debug from 'debug';
 import { EventEmitter } from 'events';
 import * as fs from 'fs-extra';
-import * as nodeAbi from 'node-abi';
-import * as os from 'os';
 import * as path from 'path';
 
-import { generateCacheKey, lookupModuleState } from './cache';
 import { BuildType, IRebuilder, RebuildMode } from './types';
 import { ModuleRebuilder } from './module-rebuilder';
 import { ModuleType, ModuleWalker } from './module-walker';
+
+import {fetch} from './fetcher';
+
+import * as tar from 'tar';
 
 export interface RebuildOptions {
   /**
    * The path to the `node_modules` directory to rebuild.
    */
   buildPath: string;
-  /**
-   * The version of Electron to build against.
-   */
-  electronVersion: string;
+
+  nodeDir: string;
+  nodeLibFile: string;
+  nodeVersion: string;
   /**
    * Override the target rebuild architecture to something other than the host system architecture.
    * 
@@ -62,31 +63,6 @@ export interface RebuildOptions {
    */
   debug?: boolean;
   /**
-   * Enables hash-based caching to speed up local rebuilds.
-   * 
-   * @experimental
-   * @defaultValue false
-   */
-  useCache?: boolean;
-  /**
-   * Whether to use the `clang` executable that Electron uses when building.
-   * This will guarantee compiler compatibility.
-   *
-   * @defaultValue false
-   */
-  useElectronClang?: boolean;
-  /**
-   * Sets a custom cache path for the {@link useCache} option.
-   * @experimental
-   * @defaultValue a `.electron-rebuild-cache` folder in the `os.homedir()` directory
-   */
-  cachePath?: string;
-  /**
-   * GitHub tag prefix passed to {@link https://www.npmjs.com/package/prebuild-install | `prebuild-install`}.
-   * @defaultValue `v`
-   */
-  prebuildTagPrefix?: string;
-  /**
    * Path to the root of the project if using npm or yarn workspaces.
    */
   projectRootPath?: string;
@@ -103,12 +79,6 @@ export interface RebuildOptions {
    */
   disablePreGypCopy?: boolean;
   /**
-   * Skip prebuild download and rebuild module from source.
-   *
-   * @defaultValue false
-   */
-  buildFromSource?: boolean;
-  /**
    * Array of module names to ignore during the rebuild process.
    */
   ignoreModules?: string[];
@@ -118,7 +88,7 @@ export interface RebuilderOptions extends RebuildOptions {
   lifecycle: EventEmitter;
 }
 
-const d = debug('electron-rebuild');
+const d = debug('node-rebuild');
 
 const defaultMode: RebuildMode = 'sequential';
 const defaultTypes: ModuleType[] = ['prod', 'optional'];
@@ -126,61 +96,36 @@ const defaultTypes: ModuleType[] = ['prod', 'optional'];
 export class Rebuilder implements IRebuilder {
   private ABIVersion: string | undefined;
   private moduleWalker: ModuleWalker;
-  nodeGypPath: string;
   rebuilds: (() => Promise<void>)[];
 
   public lifecycle: EventEmitter;
   public buildPath: string;
-  public electronVersion: string;
   public platform: string = process.platform;
   public arch: string;
   public force: boolean;
-  public headerURL: string;
   public mode: RebuildMode;
   public debug: boolean;
-  public useCache: boolean;
-  public cachePath: string;
-  public prebuildTagPrefix: string;
   public msvsVersion?: string;
-  public useElectronClang: boolean;
   public disablePreGypCopy: boolean;
-  public buildFromSource: boolean;
   public ignoreModules: string[];
+  public nodeDir: string;
+  public nodeLibFile: string;
+  public nodeVersion: string;
 
   constructor(options: RebuilderOptions) {
     this.lifecycle = options.lifecycle;
     this.buildPath = options.buildPath;
-    this.electronVersion = options.electronVersion;
+    this.nodeDir = options.nodeDir;
+    this.nodeLibFile = options.nodeLibFile;
+    this.nodeVersion = options.nodeVersion;
     this.arch = options.arch || process.arch;
     this.force = options.force || false;
-    this.headerURL = options.headerURL || 'https://www.electronjs.org/headers';
     this.mode = options.mode || defaultMode;
     this.debug = options.debug || false;
-    this.useCache = options.useCache || false;
-    this.useElectronClang = options.useElectronClang || false;
-    this.cachePath = options.cachePath || path.resolve(os.homedir(), '.electron-rebuild-cache');
-    this.prebuildTagPrefix = options.prebuildTagPrefix || 'v';
     this.msvsVersion = process.env.GYP_MSVS_VERSION;
     this.disablePreGypCopy = options.disablePreGypCopy || false;
-    this.buildFromSource = options.buildFromSource || false;
     this.ignoreModules = options.ignoreModules || [];
     d('ignoreModules', this.ignoreModules);
-
-    if (this.useCache && this.force) {
-      console.warn('[WARNING]: Electron Rebuild has force enabled and cache enabled, force take precedence and the cache will not be used.');
-      this.useCache = false;
-    }
-
-    if (typeof this.electronVersion === 'number') {
-      if (`${this.electronVersion}`.split('.').length === 1) {
-        this.electronVersion = `${this.electronVersion}.0.0`;
-      } else {
-        this.electronVersion = `${this.electronVersion}.0`;
-      }
-    }
-    if (typeof this.electronVersion !== 'string') {
-      throw new Error(`Expected a string version for electron version, got a "${typeof this.electronVersion}"`);
-    }
 
     this.ABIVersion = options.forceABI?.toString();
     const onlyModules = options.onlyModules || null;
@@ -198,21 +143,15 @@ export class Rebuilder implements IRebuilder {
     d(
       'rebuilding with args:',
       this.buildPath,
-      this.electronVersion,
       this.arch,
       extraModules,
       this.force,
-      this.headerURL,
       types,
       this.debug
     );
   }
 
   get ABI(): string {
-    if (this.ABIVersion === undefined) {
-      this.ABIVersion = nodeAbi.getAbi(this.electronVersion, 'electron');
-    }
-
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     return this.ABIVersion!;
   }
@@ -222,6 +161,14 @@ export class Rebuilder implements IRebuilder {
   }
 
   async rebuild(): Promise<void> {
+    if (!await this.downloadNodeLibrary(this.nodeVersion)) {
+        throw new Error('Could not download node library');
+    }
+
+    if (!await this.downloadNodeHeaders(this.nodeVersion)) {
+        throw new Error('Could not download node headers');
+    }
+
     if (!path.isAbsolute(this.buildPath)) {
       throw new Error('Expected buildPath to be an absolute path');
     }
@@ -247,6 +194,48 @@ export class Rebuilder implements IRebuilder {
         await rebuildFn();
       }
     }
+  }
+
+  async downloadNodeLibrary(nodeVersion: string): Promise<boolean> {
+    console.log(this.buildPath, nodeVersion);
+    // split node version and find major version
+    const nodeVersionSplit = nodeVersion.split('.');
+    const nodeMajorVersion = nodeVersionSplit[0];
+    if (!await fs.pathExists(this.buildPath + '/libnode-v' + nodeVersion + '/libnode' + nodeMajorVersion + '.lib')) {
+      const res = await fetch('https://content.cfx.re/mirrors/vendor/node/v' + nodeVersion + '/libnode/libnode' + nodeMajorVersion + '.lib', 'buffer');
+      console.log(res, typeof (res));
+      if (!await fs.pathExists(this.buildPath + '/libnode-v' + nodeVersion)) {
+        await fs.mkdir(this.buildPath + '/libnode-v' + nodeVersion);
+      }
+      await fs.writeFile(this.buildPath + '/libnode-v' + nodeVersion + '/libnode' + nodeMajorVersion + '.lib', res);
+    }
+
+    this.nodeLibFile = this.buildPath + '/libnode-v' + nodeVersion + '/libnode' + nodeMajorVersion + '.lib';
+    return true;
+  }
+  
+  async downloadNodeHeaders(nodeVersion: string): Promise<boolean> {
+    console.log(this.buildPath, nodeVersion);
+
+    if (!await fs.pathExists(this.buildPath + '/libnode-v' + nodeVersion + '/node-v' + nodeVersion)) {
+      const res = await fetch('https://nodejs.org/download/release/v' + nodeVersion + '/node-v' + nodeVersion + '-headers.tar.gz', 'buffer');
+      console.log(res, typeof (res));
+      if (!await fs.pathExists(this.buildPath + '/libnode-v' + nodeVersion)) {
+        await fs.mkdir(this.buildPath + '/libnode-v' + nodeVersion);
+      }
+
+      await fs.writeFile(this.buildPath + '/libnode-v' + nodeVersion + '/node-v' + nodeVersion + '-headers.tar.gz', res);
+
+      await tar.extract({
+        file: this.buildPath + '/libnode-v' + nodeVersion + '/node-v' + nodeVersion + '-headers.tar.gz',
+        cwd: this.buildPath + '/libnode-v' + nodeVersion
+      })
+
+      await fs.remove(this.buildPath + '/libnode-v' + nodeVersion + '/node-v' + nodeVersion + '-headers.tar.gz');
+    }
+
+    this.nodeDir = this.buildPath + '/libnode-v' + nodeVersion + '/node-v' + nodeVersion;
+    return true;
   }
 
   async rebuildModuleAt(modulePath: string): Promise<void> {
@@ -278,32 +267,8 @@ export class Rebuilder implements IRebuilder {
       this.lifecycle.emit('module-skip', moduleName);
       return;
     }
-
-    if (await moduleRebuilder.prebuildInstallNativeModuleExists()) {
-      d(`skipping: ${moduleName} as it was prebuilt`);
-      return;
-    }
-
-    let cacheKey!: string;
-    if (this.useCache) {
-      cacheKey = await generateCacheKey({
-        ABI: this.ABI,
-        arch: this.arch,
-        debug: this.debug,
-        electronVersion: this.electronVersion,
-        headerURL: this.headerURL,
-        modulePath,
-      });
-
-      const applyDiffFn = await lookupModuleState(this.cachePath, cacheKey);
-      if (typeof applyDiffFn === 'function') {
-        await applyDiffFn(modulePath);
-        this.lifecycle.emit('module-done', moduleName);
-        return;
-      }
-    }
-
-    if (await moduleRebuilder.rebuild(cacheKey)) {
+    
+    if (await moduleRebuilder.rebuild()) {
       this.lifecycle.emit('module-done', moduleName);
     }
   }

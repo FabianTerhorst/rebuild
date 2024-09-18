@@ -24,6 +24,7 @@ process.on('message', async ({
         }
       }
       await promisify(nodeGyp.commands[command.name])(command.args);
+      console.log(nodeGyp.commands[command.name], command.args);
       command = nodeGyp.todo.shift();
     }
     process.exit(0);
